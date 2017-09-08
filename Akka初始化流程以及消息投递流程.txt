@@ -1,0 +1,115 @@
+akka.actor.default-dispatcher.default-executor.fallback
+
+
+
+Dispatch.scala   sendMessage
+
+Dispatcher.scala dispatch
+
+是否会有消息没有被消费的情况，也即消息没有被成功投递
+
+
+val system = ActorSystem("AkkaLocalTest") 
+启动一个Actor System，这里会调用object ActorSystem的apply方法，这个方法中，会初始化一些信息：主要是配置信息，以及一些dispatcher等等。
+1、首先是一个BootstrapSetup，顾名思义，它是一个启动器设置，也就是System的启动设置，继承自Setup。
+    1.设置一些ClassLoader(没有设置时，使用当前线程的ClassLoader)，Config，ExecutionContext(就是一个线程池，ExecutorService)
+2、ActorSystemSetup 它是ActorSystem配置设置
+3、最终，会调用ActorSystem中的apply(String,ActorSystemSetup)方法，这个方法中会做一些初始化工作
+    1.  配置Classloader，这里是获取当前线程的Classloader。
+    2.  获取配置信息，ConfigFactory.load(Classloader)，获取所有jar中的reference.conf，以及文件名为application的后缀为.json,.conf,.properties。生成最终的Config
+    3.  获取defaultExecutionContext
+    4.  new 一个ActorSystemImpl，并调用 start方法，在这个方法中，会调用provider.init方法等。
+4、ActorSystemImpl的初始化。
+    1.   初始化一个Setting变量，而在Setting中，初始化的信息有：
+        1、获取Akka的版本号
+        2、获取一个ProviderClass，这个主要是要ActorSystem知道使用的是什么provider，有local、remote、cluster、fqcn
+        3、获取监控策略类
+        4、actor 创建超时时间
+        5、是否允许使用Java序列化
+        6、日志级别
+        7、获取调度类SchedulerClass。默认使用的是akka.actor.LightArrayRevolverScheduler
+        以上就是Setting的主要配置信息。
+    2.  创建一个MonitorableThreadFactory的threadFactory，主要是用来创建worker的。
+        1、就是创建一个ForkJoinWorkerThread的Thread。
+    3.  初始化DynamicAccess类，new了一个ReflectiveDynamicAccess。
+        1、可以理解为它是一个反射类的方法汇总。
+        2、它里面的返回值是一个Try对象，有Success、Failure子类。
+    4.  初始化EventStream变量
+        1、注册Logger到EventStream，这个Stream其实就是LoggingBus或者就是EventBus。
+        2、使用Pub/Sub来进行消息通知的。
+    5.  创建LoggingFilter，这个根据字面意思，是日志的过滤器
+        1、判断是否满足日志输出级别
+    6.  markerLogging变量，是一个LoggingAdapter，是一个记录日志的方法，比如log.info等等
+    7.  scheduler调度器变量，是一个Scheduler。
+        1、这个也就是setting中的LightArrayRevolverScheduler。
+        2、跟netty的HashedWheelTimer差不多，就是定时调度任务。
+    8.  provider变量，是一个ActorRefProvider，根据setting中的ProviderClass来的，
+        1、如果是local，则是LocalActorRefProvider，这个类的主要功能是：
+            1.获取rootpath
+            2.创建logger对象
+            3.创建deadLetters InternalActorRef
+            4.生成temp临时路径以及计数
+            5.theOneWhoWalksTheBubblesOfSpaceTime，它的注释说：它是监控层次的顶级锚点，只会接收监控、孩子终止的系统消息或者失败消息
+            6.guardianStrategy，守护监控策略配置器，用到user下
+            7.lazy defaultDispatcher，默认的dispatcher，生成Dispatcher，在生成Dispatcher过程中，需要生成ExecutorServiceFactoryProvider
+                1、如果在初始化ActorSystem时，没有传递defaultExecutionContext，则默认使用配置中的default-executor.fallback。
+            8.lazy defaultMailbox，默认邮箱配置类型MailboxType，UnboundedMailbox，也就是ConcurrentLinkedQueue
+            9.lazy rootGuardian，根守卫，也就是一个LocalActorRef，其中初始化是：
+                1、actorCell，也即actor的执行单元。创建一个ActorCell
+                    1.这里面大多数多少var类型的变量，它是一个执行发送，解析动作
+                2、调用actorCell的init方法，进行初始化(其实是Dispatch的init，它是一个trait)。
+                    1.根据MailboxType创建一个MailBox，
+                        1、MailBox，其实是一个Runnable，ForkJoinTask，我的理解：之所以会继承这两个，是因为可能不使用forkjoinpool或者使用。
+                        2、最主要的就是run方法，以及更改队列状态，判断是否有消息，以及throughput的处理，还有throughput-deadline-time的处理。
+                        3、先处理所有的系统消息，然后再处理所有的邮箱消息。
+                    2.创建一个createMessage，这个主要是Create(None)消息体。
+                    3.swapMailbox,把新建的mailbox赋值给Dispatch的mailbox，使用的是CAS(Compare and swap)机制。
+                    4.把创建的actorCell设置给mailBox的ActorCell。调用  mailbox.setActor
+                    5.调用mailBox.systemEnqueue方法，把创建消息发送给自己，参数是self(这个是rootGuardian的LocalActorRef), createMessage。
+                        1、在这个方法中，只是把createMessage放到了最新的消息头部。
+                    6.判断是否需要发送给上层监控，这里传递的是true，所以需要发送。这里，也就是调用theOneWhoWalksTheBubblesOfSpaceTime的sendSystemMessage，看它的代码，它什么也没有做。
+                    7.actorCell的初始化完成。
+                3、以上就是LocalActorRef的初始化。
+                4、在Start方法中，会调用actorCell的方法，然后调用dispatcher.attach方法，
+                    1.注册Actor，也就是计数加1
+                    2.执行registerForExecution，也就是使用线程池执行MailBox中的run。
+                        1、在run中，先执行系统消息，在actorCell初始化时，先放了一个Create(None)系统消息，所以它先消费这个消息
+                        2、在处理系统消息时，主要是调用actorCell的systemInvoke,在这个方法中，就是真正的创建Actor实体，也即根据props.newActor创建。
+                        3、指定ActorCell的actor为刚创建的instance。
+                        4、调用instance的aroundPreStart方法，也即Actor的preStart。
+                        5、如果akka.actor.debug.lifecycle是true，则广播此消息。
+                5、至此，这个rootGuardian已经完全的初始化完成。
+            10、lazy guardian 是一个LocalActorRef的方法,这是一个user守护。
+                1、获取rootGuardian的actorCell，然后把user作为它的孩子
+                2、new 一个LocalActorRef，如果在ActorSystem初始化时，没有配置guardianProps，则使用Guardian      
+                3、LocalActorRef的初始化参考第9条。
+                    1.与上面初始化不一样的是，它的父亲是rootGuardian。
+                4、调用第一步中获取的actorCell的initChild，也就是初始化一些状态
+                5、调用LocalActorRef的Start方法。这时候的初始化过程就跟4-8-1-9-4是一样的了。
+                6、它创建的是一个Guardian  Actor
+            11、systemGuardian，它也是一个LocalActorRef，它是一个system的守护，父节点同样是rootGuardian，跟guardian初始化是一样的，它是一个SystemGuardian。
+        2、如果是remote，则是RemoteActorRefProvider
+        3、如果是cluster，则是ClusterActorRefProvider
+        4、如果是fqcn，则是fqcn，也即其它的provider
+        5、
+    9.  在Start方法中，调用provider.init方法
+        1、在init方法中，调用了rootGuardian.start方法，由于rootGuardian是lazy的，所以这时候开始初始化它。
+        2、systemGuardian调用sendSystemMessage，发送一个Watch，监控guardian
+        3、rootGuardian调用sendSystemMessage，发送一个Watch，监控systemGuardian
+        4、eventStream开始startDefaultLoggers。
+    10. ActorSystem初始化完成.
+5、调用system.actorOf方法，用来创建一个Actor，然后就可以使用此ref发送消息了。
+
+
+
+ReliableDeliverySupervisor
+
+RemoteActorRef
+
+
+
+val transportSupervisor = system.systemActorOf(configureDispatcher(Props[TransportSupervisor]),"transports")
+
+
+
+DefaultExecutorServiceConfigurator
