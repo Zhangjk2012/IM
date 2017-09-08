@@ -9,6 +9,8 @@ Dispatcher.scala dispatch
 是否会有消息没有被消费的情况，也即消息没有被成功投递
 
 
+
+
 val system = ActorSystem("AkkaLocalTest") 
 启动一个Actor System，这里会调用object ActorSystem的apply方法，这个方法中，会初始化一些信息：主要是配置信息，以及一些dispatcher等等。
 1、首先是一个BootstrapSetup，顾名思义，它是一个启动器设置，也就是System的启动设置，继承自Setup。
